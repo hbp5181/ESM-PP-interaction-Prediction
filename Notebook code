@@ -1,3 +1,80 @@
-git remote add origin https://github.com/hbp5181/ESM-PP-interaction-Prediction.git
-git branch -M main
-git push -u origin main
+!pip install torch
+!pip install datasets
+!git clone https://github.com/DeepGraphLearning/torchdrug
+!pip install torchdrug
+!pip install torch-scatter
+!pip install torch-cluster
+from google.colab import drive
+drive.mount('/content/drive')
+# Check current permissions
+!ls -l /content/torchdrug/torchdrug
+
+# Add read permission if necessary
+!chmod +r /content/torchdrug/torchdrug
+import os
+# Specify the directory path you want to change to
+new_directory = "/content/torchdrug/torchdrug"
+# Change the current working directory to the specified path
+os.chdir(new_directory)
+# Verify the current working directory has changed
+current_directory = os.getcwd()
+print(f"Current working directory: {current_directory}")
+
+# This part has been modifed to use the ESM model to predict the PP interaction rather than CNN model
+# there are two versions of ems model, esm-1b and esm-1v. this code uses esm-1b.
+from torchdrug import models
+# Specify the path to the ESM model weights file in Google Drive
+model_weights_path = "/content/drive/MyDrive/model"  # Replace with the your path
+
+# Create an instance of the ESM model, this code is directly from the website
+model = models.ESM(path=model_weights_path, model='ESM-1b', readout='mean')
+
+
+# This part uses the residue values to trasnform the protein
+from torchdrug import transforms
+truncate_transform = transforms.TruncateProtein(max_length=200, random=False)
+protein_view_transform = transforms.ProteinView(view="residue")
+transform = transforms.Compose([truncate_transform, protein_view_transform])
+
+
+#imports data of BetaLactamase from the torchdurg. We can replace this part without own datasets
+from torchdrug import datasets
+dataset = datasets.BetaLactamase("~/protein-datasets/", atom_feature=None, bond_feature=None, residue_feature="default", transform=transform)
+train_set, valid_set, test_set = dataset.split()
+print("The label of first sample: ", dataset[0][dataset.target_fields[0]])
+print("train samples: %d, valid samples: %d, test samples: %d" % (len(train_set), len(valid_set), len(test_set)))
+
+
+
+# We first build the dataset via datasets.PPIAffinity, in which each sample is a pair of proteins,
+# and it is associated with a continuous label indicating the binding affinity.
+# Since we now need to perform transformation on both proteins, we need to specify keys in the transformation function.
+# This code only utilize the residue values. Atom featurs, bond futures are omitted.
+truncate_transform_ = transforms.TruncateProtein(max_length=200, keys=("graph1", "graph2"))
+protein_view_transform_ = transforms.ProteinView(view="residue", keys=("graph1", "graph2"))
+transform_ = transforms.Compose([truncate_transform_, protein_view_transform_])
+dataset = datasets.PPIAffinity("~/protein-datasets/", atom_feature=None, bond_feature=None, residue_feature="default", transform=transform_)
+train_set, valid_set, test_set = dataset.split()
+print("The label of first sample: ", dataset[0][dataset.target_fields[0]])
+print("train samples: %d, valid samples: %d, test samples: %d" % (len(train_set), len(valid_set), len(test_set)))
+
+
+
+# To perform PPI affinity prediction, we wrap the ESM encoder into the tasks.InteractionPrediction module
+# which appends a task-specific MLP prediction head upon ESM model.
+from torchdrug import tasks
+task = tasks.PropertyPrediction(model, task=dataset.tasks,
+                                criterion="mse", metric=("mae", "rmse", "spearmanr"),
+                                normalization=False, num_mlp_layer=2)
+
+
+
+# model training process. Modify batch size. Will take a long time. Running aborted if you see some results.
+import torch
+from torchdrug import core
+
+optimizer = torch.optim.Adam(task.parameters(), lr=1e-4)
+solver = core.Engine(task, train_set, valid_set, test_set, optimizer,
+                     gpus=[0], batch_size=1)
+solver.train(num_epoch=10)
+solver.evaluate("valid")
